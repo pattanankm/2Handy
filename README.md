@@ -12,7 +12,7 @@ This project is a Backend API for the "2Handy" secondhand marketplace platform, 
 
 ## System Architecture
 
-![Architecture Diagram](IMG_7793.jpg)
+![Architecture Diagram](ArchitectureDiagram.jpg)
 
 The system is designed with separated responsibilities within a Docker Compose environment:
 * **Web Frontend:** The "2Handy" user interface connecting via REST API.
