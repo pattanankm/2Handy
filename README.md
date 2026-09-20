@@ -14,11 +14,11 @@ This project is a Backend API for the "2Handy" secondhand marketplace platform, 
 
 ![Architecture Diagram](IMG_7793.jpg)
 
-The system is designed with separated responsibilities within a Docker Compose environment[cite: 17]:
-* **Web Frontend:** The "2Handy" user interface connecting via REST API[cite: 17].
-* **Backend API:** Built with Python (FastAPI), serving as the core engine to process and route data[cite: 17].
-* **PostgreSQL (Transactional Data):** A relational database managing core transactional domain data (`Users`, `Orders`, and `Order Items`)[cite: 1, 17].
-* **MongoDB (Flexible Data):** A document store managing flexible, semi-structured data (`Products` and `Reviews`)[cite: 1, 17].
+The system is designed with separated responsibilities within a Docker Compose environment:
+* **Web Frontend:** The "2Handy" user interface connecting via REST API.
+* **Backend API:** Built with Python (FastAPI), serving as the core engine to process and route data.
+* **PostgreSQL (Transactional Data):** A relational database managing core transactional domain data (`Users`, `Orders`, and `Order Items`).
+* **MongoDB (Flexible Data):** A document store managing flexible, semi-structured data (`Products` and `Reviews`).
 
 ---
 
