@@ -1,6 +1,6 @@
-# 2Handy - Secondhand Marketplace API ("2nd Hand 2 U")
+# 2Handy - Secondhand Marketplace API
 
-This project is a Backend API for the "2nd Hand 2 U" secondhand marketplace platform, developed as part of Checkpoint 1 (CP1) for the course **269340: Data Centric Application Development**. The project implements a Dual-Database architecture to separate transactional data management from highly flexible data storage.
+This project is a Backend API for the "2Handy" secondhand marketplace platform, developed as part of Checkpoint 1 (CP1) for the course **269340: Data Centric Application Development**. The project implements a Dual-Database architecture to separate transactional data management from highly flexible data storage.
 
 ## 👥 Team Roster (the smachik gang)
 * **1:** 670615108 Prempracha Numchai - PostgreSQL (Users + Orders)
@@ -12,7 +12,7 @@ This project is a Backend API for the "2nd Hand 2 U" secondhand marketplace plat
 
 ## System Architecture
 
-![Architecture Diagram](IMG_7793.jpeg)
+![Architecture Diagram](IMG_7793.jpg)
 
 The system is designed with separated responsibilities within a Docker Compose environment[cite: 17]:
 * **Web Frontend:** The "2Handy" user interface connecting via REST API[cite: 17].
