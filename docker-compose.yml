@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  # 1. setting PostgreSQL for Transactional Data
+  postgres_db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: main_db
+      POSTGRES_USER: dev_user
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # can map folder for run DDL scripts ตอนสร้าง DB ได้ตาม requirement
+      # - ./init-scripts:/docker-entrypoint-initdb.d 
+
+  # 2. setting MongoDB for Flexible Data
+  mongo_db:
+    image: mongo:6.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+# ประกาศ Volumes (data not gone when container is removed) Docker (Volume persistence)
+volumes:
+  pg_data:
+  mongo_data:
