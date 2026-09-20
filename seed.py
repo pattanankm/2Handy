@@ -1,10 +1,10 @@
 # seed.py
 from faker import Faker
 import random
-from database import SessionLocal, engine
+from database import SessionLocal, engine, get_mongo_db
 import models
 
-#ลบตารางเก่า (ถ้ามี) เพื่อเริ่มต้นใหม่
+# ลบตารางเก่า (ถ้ามี) เพื่อเริ่มต้นใหม่
 models.Base.metadata.drop_all(bind=engine)
 # 1. สั่งให้ SQLAlchemy สร้างตารางใน PostgreSQL (ถ้ายังไม่มี)
 models.Base.metadata.create_all(bind=engine)
@@ -19,31 +19,26 @@ def seed_postgres(num_users=1000, num_orders=1000):
         for _ in range(num_users):
             user = models.User(
                 name=fake.name(),
-                email=fake.unique.email() # ใช้ fake.unique เพื่อไม่ให้อีเมลซ้ำกัน
+                email=fake.unique.email()
             )
             db.add(user)
         
-        # บันทึก Users ลง DB ก่อน เพื่อให้ระบบสร้าง ID ให้แต่ละคน
         db.commit()
         
         print("Creating Orders and Order Items...")
-        # ดึงรายชื่อ User ทั้งหมดออกมาเพื่อสุ่มจับคู่กับ Order
         all_users = db.query(models.User).all()
         
         for _ in range(num_orders):
-            # สุ่มลูกค้า 1 คน
             random_user = random.choice(all_users)
             
-            # สร้างใบสั่งซื้อ
             order = models.Order(
                 user_id=random_user.id,
-                total_amount=0, # จะคำนวณทีหลัง
+                total_amount=0,
                 status=random.choice(["pending", "completed", "cancelled"])
             )
             db.add(order)
-            db.flush() # ใช้ flush เพื่อให้ได้ order.id มาใช้ต่อโดยยังไม่ commit
+            db.flush()
             
-            # สร้างรายการสินค้าในใบสั่งซื้อ (สุ่ม 1-3 ชิ้นต่อออเดอร์)
             total_amount = 0
             for _ in range(random.randint(1, 3)):
                 unit_price = random.randint(100, 5000)
@@ -52,24 +47,67 @@ def seed_postgres(num_users=1000, num_orders=1000):
                 
                 item = models.OrderItem(
                     order_id=order.id,
-                    product_id=fake.uuid4(), # จำลองรหัส MongoDB ID เป็น String ไปก่อน
+                    product_id=fake.uuid4(), # จำลองรหัส MongoDB ID เป็น String
                     quantity=quantity,
                     unit_price=unit_price
                 )
                 db.add(item)
             
-            # อัปเดตราคารวมของใบสั่งซื้อ
             order.total_amount = total_amount
         
-        # บันทึกข้อมูล Orders และ Items ทั้งหมดลง DB
         db.commit()
-        print("✅ create data to PostgreSQL completed!")
+        print("✅ Create data to PostgreSQL completed!")
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in PostgreSQL seed: {e}")
         db.rollback()
     finally:
         db.close()
 
+def seed_mongo(num_products=1000):
+    try:
+        # เรียกใช้ connection ของ MongoDB
+        db_conn = get_mongo_db()
+        
+        import types
+        if isinstance(db_conn, types.GeneratorType):
+            mongo_db = next(db_conn)
+        else:
+            mongo_db = db_conn
+            
+        print("Creating Products in MongoDB...")
+        # ล้างข้อมูลเก่าทิ้งก่อนเพื่อไม่ให้ซ้ำซ้อน
+        mongo_db["products"].drop() 
+        
+        products = []
+        categories = ["Electronics", "Clothing", "Books", "Furniture", "Vehicles"]
+        conditions = ["New", "Like New", "Good", "Fair"]
+        
+        for _ in range(num_products):
+            category = random.choice(categories)
+            product = {
+                "name": fake.catch_phrase(),
+                "category": category,
+                "status": "available", 
+                "attributes": {
+                    "condition": random.choice(conditions),
+                    "price": round(random.uniform(50.0, 10000.0), 2),
+                    "brand": fake.company() if category in ["Electronics", "Vehicles"] else None
+                }
+            }
+            # ลบค่า None ออกจาก attributes
+            product["attributes"] = {k: v for k, v in product["attributes"].items() if v is not None}
+            
+            products.append(product)
+            
+        mongo_db["products"].insert_many(products)
+        print("✅ Create data to MongoDB completed!")
+        
+    except Exception as e:
+        print(f"❌ Error in MongoDB seed: {e}")
+
 if __name__ == "__main__":
+    print("--- 🚀 Starting Database Seeding ---")
     seed_postgres()
+    seed_mongo()
+    print("--- 🎉 All Seeding Completed! ---")
