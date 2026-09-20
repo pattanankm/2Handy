@@ -6,6 +6,7 @@ from typing import Dict, Any, List
 from bson import ObjectId
 
 import models
+import schemas #from polly's branch
 from database import engine, get_pg_db, get_mongo_db
 
 # สั่งให้สร้างตารางใน PostgreSQL (ถ้ายังไม่มี)
@@ -23,9 +24,6 @@ class ProductCreate(BaseModel):
     category: str
     attributes: Dict[str, Any] # รับค่า Dynamic attributes แบบยืดหยุ่นสำหรับ MongoDB
 
-# ==========================================
-# Endpoints สำหรับ PostgreSQL (Users)
-# ==========================================
 
 class OrderItemCreate(BaseModel):
     product_id: str
@@ -34,6 +32,17 @@ class OrderItemCreate(BaseModel):
 class OrderCreate(BaseModel):
     user_id: int
     items: List[OrderItemCreate]
+
+#from polly's branch
+class ReviewCreate(BaseModel):
+    product_id: str
+    user_id: int
+    rating: int
+    comment: str
+
+# ==========================================
+# Endpoints สำหรับ PostgreSQL (Users)
+# ==========================================
 
 @app.post("/api/v1/users", status_code=201)
 def create_user(user: UserCreate, db: Session = Depends(get_pg_db)):
@@ -50,6 +59,7 @@ def get_user(user_id: int, db: Session = Depends(get_pg_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
 
 # ==========================================
 # Endpoints สำหรับ MongoDB (Products)
@@ -73,6 +83,15 @@ def get_products(mongo_db = Depends(get_mongo_db)):
         prod["_id"] = str(prod["_id"]) # แปลง ObjectId ให้เป็น String
     return products
 
+#from polly's branch
+@app.post("/api/v1/reviews", status_code=201)
+def create_review(review: schemas.Review, mongo_db = Depends(get_mongo_db)):
+    # เพิ่ม Endpoint ให้รองรับ Review ของคนที่ 2
+    review_dict = review.model_dump() if hasattr(review, "model_dump") else review.dict()
+    result = mongo_db["reviews"].insert_one(review_dict)
+    review_dict["_id"] = str(result.inserted_id)
+    return {"message": "Review created", "review": review_dict}
+
 # ==========================================
 # Endpoint แบบ Dual-DB (Orders)
 # ==========================================
@@ -81,6 +100,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
     # 1. ตรวจสอบข้อมูล Product จาก MongoDB (ดึงราคา, สต็อก)
     # 2. บันทึก Transaction การสั่งซื้อลง PostgreSQL (ตาราง orders, order_items)
     # 3. อัปเดตข้อมูลหรือทำ Audit log กลับไปที่ MongoDB
+
     #from ice's branch
     if not hasattr(models, "Order") or not hasattr(models, "OrderItem"):
         raise HTTPException(
