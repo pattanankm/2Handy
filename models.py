@@ -8,7 +8,11 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
+    # Legacy column (kept during Expand, Dual Write, Backfill, Switch Read; dropped in Contract)
+    name = Column(String, index=True, nullable=True)
+    # Expanded columns (added in Phase 1 Expand)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
     email = Column(String, unique=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
