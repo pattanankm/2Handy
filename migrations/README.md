@@ -6,7 +6,12 @@ This is the Database Admin scope for CP2.  It implements the selected migration 
 public.users.name  ->  public.users.first_name + public.users.last_name
 ```
 
-`name` is the existing field in [models.py](../models.py).  `last_name` deliberately remains nullable: a one-word legacy name is valid when the future backfill stores it in `first_name` and leaves `last_name` empty.  The verification scripts compare the reconstructed full name, so this does not weaken the data-loss check.
+`name` is the existing field in [models.py](../models.py). The API also
+dual-writes `full_name` as a compatibility alias while the split is rolled
+out. `last_name` deliberately remains nullable: a one-word legacy name is
+valid when the future backfill stores it in `first_name` and leaves
+`last_name` empty. The verification scripts compare the reconstructed full
+name, so this does not weaken the data-loss check.
 
 ## Phase 1 — Expand
 

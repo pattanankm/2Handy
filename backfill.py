@@ -19,13 +19,16 @@ def run_backfill(batch_size=100):
 
             for user in users:
                 # แยกชื่อและนามสกุลจากคอลัมน์ name เดิม
-                if user.name:
-                    parts = user.name.split(" ", 1)
+                legacy_name = user.full_name or user.name
+                if legacy_name:
+                    parts = legacy_name.split(" ", 1)
                     user.first_name = parts[0]
                     user.last_name = parts[1] if len(parts) > 1 else ""
+                    user.full_name = legacy_name
                 else:
                     user.first_name = "Unknown"
                     user.last_name = "Unknown"
+                    user.full_name = "Unknown Unknown"
 
             # บันทึกข้อมูลทีละ Batch
             db.commit()

@@ -1,8 +1,9 @@
 # main.py
 from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 from bson import ObjectId
 
 import models
@@ -16,8 +17,77 @@ app = FastAPI(title="2Handy API")
 
 # --- Pydantic Schemas สำหรับรับข้อมูลจาก Request ---
 class UserCreate(BaseModel):
-    name: str
+    name: Optional[str] = None
+    full_name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     email: str
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    full_name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+
+
+def _split_full_name(full_name: str) -> Tuple[str, str]:
+    """Split at the first whitespace; names with more parts keep them in last_name."""
+    normalized = " ".join(full_name.split())
+    if not normalized:
+        raise HTTPException(status_code=422, detail="Name must not be empty")
+    first_name, separator, last_name = normalized.partition(" ")
+    return first_name, last_name if separator else ""
+
+
+def _resolve_name_parts(
+    name: Optional[str],
+    full_name: Optional[str],
+    first_name: Optional[str],
+    last_name: Optional[str],
+) -> Tuple[str, str, str]:
+    legacy_name = full_name or name
+    if full_name and name and full_name != name:
+        raise HTTPException(status_code=422, detail="name and full_name must match")
+
+    if legacy_name:
+        split_first, split_last = _split_full_name(legacy_name)
+        if first_name is not None and first_name != split_first:
+            raise HTTPException(status_code=422, detail="first_name conflicts with full_name")
+        if last_name is not None and last_name != split_last:
+            raise HTTPException(status_code=422, detail="last_name conflicts with full_name")
+        return legacy_name, split_first, split_last
+
+    if first_name is None:
+        raise HTTPException(status_code=422, detail="Provide full_name or first_name")
+    normalized_first = " ".join(first_name.split())
+    normalized_last = " ".join((last_name or "").split())
+    if not normalized_first:
+        raise HTTPException(status_code=422, detail="first_name must not be empty")
+    combined = " ".join(part for part in (normalized_first, normalized_last) if part)
+    return combined, normalized_first, normalized_last
+
+
+def _user_response(user: models.User) -> Dict[str, Any]:
+    first_name = user.first_name or ""
+    last_name = user.last_name or ""
+    if not first_name and not last_name:
+        # Temporary rollout safety net for rows not processed by backfill yet.
+        legacy_name = user.full_name or user.name or ""
+        if legacy_name:
+            first_name, last_name = _split_full_name(legacy_name)
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    return {
+        "id": user.id,
+        "name": user.name or full_name,
+        "full_name": full_name,
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": user.email,
+        "created_at": user.created_at,
+    }
+
 
 class ProductCreate(BaseModel):
     name: str
@@ -53,20 +123,97 @@ class OrderCreate(BaseModel):
     items: List[OrderItemCreate]
 
 @app.post("/api/v1/users", status_code=201)
+@app.post("/users", status_code=201, include_in_schema=False)
 def create_user(user: UserCreate, db: Session = Depends(get_pg_db)):
-    # สร้าง User ลงใน PostgreSQL
-    db_user = models.User(name=user.name, email=user.email)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return {"message": "User created", "user": db_user}
+    legacy_name, first_name, last_name = _resolve_name_parts(
+        user.name, user.full_name, user.first_name, user.last_name
+    )
+    db_user = models.User(
+        name=legacy_name,
+        full_name=legacy_name,
+        first_name=first_name,
+        last_name=last_name,
+        email=user.email,
+    )
+    try:
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already exists")
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not create user")
+    return {"message": "User created", "user": _user_response(db_user)}
+
 
 @app.get("/api/v1/users/{user_id}")
+@app.get("/users/{user_id}", include_in_schema=False)
 def get_user(user_id: int, db: Session = Depends(get_pg_db)):
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return user
+    return _user_response(user)
+
+
+@app.get("/api/v1/users")
+@app.get("/users", include_in_schema=False)
+def get_users(db: Session = Depends(get_pg_db)):
+    return [_user_response(user) for user in db.query(models.User).all()]
+
+
+@app.put("/api/v1/users/{user_id}")
+@app.put("/users/{user_id}", include_in_schema=False)
+def update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get_pg_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    has_name_update = any(
+        value is not None
+        for value in (
+            user_update.name,
+            user_update.full_name,
+            user_update.first_name,
+            user_update.last_name,
+        )
+    )
+    if has_name_update:
+        current_first = user.first_name or _split_full_name(user.full_name or user.name)[0]
+        current_last = user.last_name or _split_full_name(user.full_name or user.name)[1]
+        if user_update.name is not None or user_update.full_name is not None:
+            legacy_name, first_name, last_name = _resolve_name_parts(
+                user_update.name,
+                user_update.full_name,
+                user_update.first_name,
+                user_update.last_name,
+            )
+        else:
+            first_name = user_update.first_name or current_first
+            last_name = user_update.last_name if user_update.last_name is not None else current_last
+            legacy_name = " ".join(part for part in (first_name, last_name) if part)
+            legacy_name, first_name, last_name = _resolve_name_parts(
+                None, legacy_name, None, None
+            )
+        user.name = legacy_name
+        user.full_name = legacy_name
+        user.first_name = first_name
+        user.last_name = last_name
+
+    if user_update.email is not None:
+        user.email = user_update.email
+
+    try:
+        db.commit()
+        db.refresh(user)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Email already exists")
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Could not update user")
+    return _user_response(user)
 
 
 # ==========================================
@@ -108,11 +255,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
     # 1. ตรวจสอบข้อมูล Product จาก MongoDB (ดึงราคา, สต็อก)
     # 2. บันทึก Transaction การสั่งซื้อลง PostgreSQL (ตาราง orders, order_items)
     # 3. อัปเดตข้อมูลหรือทำ Audit log กลับไปที่ MongoDB
-<<<<<<< HEAD
-
     #from ice's branch
-=======
->>>>>>> 68a6b1ae40f7afb3c0d5102bac34ab8bb51c982e
     if not hasattr(models, "Order") or not hasattr(models, "OrderItem"):
         raise HTTPException(
             status_code=503,
