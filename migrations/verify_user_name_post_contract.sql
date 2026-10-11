@@ -2,6 +2,8 @@
 -- The pre-contract full legacy-to-new comparison must be retained as evidence,
 -- because users.name intentionally no longer exists at this point.
 
+\pset pager off
+
 -- The legacy field must be absent.
 SELECT NOT EXISTS (
     SELECT 1

@@ -5,6 +5,8 @@
 -- psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
 --   -f migrations/verify_user_name_migration.sql
 
+\pset pager off
+
 -- A. Schema proof (Phase 1): all three fields must coexist before Contract.
 SELECT column_name, data_type, is_nullable
 FROM information_schema.columns

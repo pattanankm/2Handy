@@ -7,6 +7,8 @@
 -- Run with:
 --   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/001_expand_user_name.sql
 
+\pset pager off
+
 BEGIN;
 
 -- Do not wait indefinitely for a DDL lock while the API is serving traffic.

@@ -17,6 +17,8 @@
   \quit
 \endif
 
+\pset pager off
+
 BEGIN;
 
 -- Never queue a disruptive ACCESS EXCLUSIVE lock behind live API traffic.
