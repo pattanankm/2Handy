@@ -44,6 +44,14 @@ class ReviewCreate(BaseModel):
 # Endpoints สำหรับ PostgreSQL (Users)
 # ==========================================
 
+class OrderItemCreate(BaseModel):
+    product_id: str
+    quantity: int = 1
+
+class OrderCreate(BaseModel):
+    user_id: int
+    items: List[OrderItemCreate]
+
 @app.post("/api/v1/users", status_code=201)
 def create_user(user: UserCreate, db: Session = Depends(get_pg_db)):
     # สร้าง User ลงใน PostgreSQL
@@ -100,8 +108,11 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
     # 1. ตรวจสอบข้อมูล Product จาก MongoDB (ดึงราคา, สต็อก)
     # 2. บันทึก Transaction การสั่งซื้อลง PostgreSQL (ตาราง orders, order_items)
     # 3. อัปเดตข้อมูลหรือทำ Audit log กลับไปที่ MongoDB
+<<<<<<< HEAD
 
     #from ice's branch
+=======
+>>>>>>> 68a6b1ae40f7afb3c0d5102bac34ab8bb51c982e
     if not hasattr(models, "Order") or not hasattr(models, "OrderItem"):
         raise HTTPException(
             status_code=503,
