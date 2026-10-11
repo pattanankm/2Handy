@@ -38,7 +38,11 @@ For the post-backfill result to pass:
 - `mismatched_or_missing_rows` must be `0`; and
 - the detailed exception query must return no rows.
 
-The Data Engineer owns the batched backfill. The Backend Engineer must complete dual-write and switch-read before Phase 5; neither is included in these database-only scripts.
+The Data Engineer owns the batched backfill. The Backend Engineer has
+implemented dual-write and switch-read in the API. Before using the switched
+read endpoints in production, run the backfill and confirm the verification
+queries pass; the API no longer falls back to `name` or `full_name` when
+building user responses.
 
 ## Phase 5 — Contract
 

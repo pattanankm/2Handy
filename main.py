@@ -72,15 +72,10 @@ def _resolve_name_parts(
 def _user_response(user: models.User) -> Dict[str, Any]:
     first_name = user.first_name or ""
     last_name = user.last_name or ""
-    if not first_name and not last_name:
-        # Temporary rollout safety net for rows not processed by backfill yet.
-        legacy_name = user.full_name or user.name or ""
-        if legacy_name:
-            first_name, last_name = _split_full_name(legacy_name)
     full_name = " ".join(part for part in (first_name, last_name) if part)
     return {
         "id": user.id,
-        "name": user.name or full_name,
+        "name": full_name,
         "full_name": full_name,
         "first_name": first_name,
         "last_name": last_name,
