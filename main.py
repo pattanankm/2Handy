@@ -1,10 +1,12 @@
 # main.py
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from typing import Dict, Any, List
+from bson import ObjectId
 
 import models
+import schemas #from polly's branch
 from database import engine, get_pg_db, get_mongo_db
 
 # สั่งให้สร้างตารางใน PostgreSQL (ถ้ายังไม่มี)
@@ -20,34 +22,23 @@ class UserCreate(BaseModel):
 class ProductCreate(BaseModel):
     name: str
     category: str
-    attributes: Dict[str, Any]  # รับค่า Dynamic attributes แบบยืดหยุ่นสำหรับ MongoDB
+    attributes: Dict[str, Any] # รับค่า Dynamic attributes แบบยืดหยุ่นสำหรับ MongoDB
+
 
 class OrderItemCreate(BaseModel):
     product_id: str
     quantity: int = 1
-    unit_price: int = 0
 
 class OrderCreate(BaseModel):
     user_id: int
     items: List[OrderItemCreate]
 
-class OrderItemRead(BaseModel):
-    id: int
-    order_id: int
+#from polly's branch
+class ReviewCreate(BaseModel):
     product_id: str
-    quantity: int
-    unit_price: int
-
-    model_config = ConfigDict(from_attributes=True)
-
-class OrderRead(BaseModel):
-    id: int
     user_id: int
-    total_amount: int
-    status: str
-    items: List[OrderItemRead]
-
-    model_config = ConfigDict(from_attributes=True)
+    rating: int
+    comment: str
 
 # ==========================================
 # Endpoints สำหรับ PostgreSQL (Users)
@@ -68,6 +59,7 @@ def get_user(user_id: int, db: Session = Depends(get_pg_db)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
 
 # ==========================================
 # Endpoints สำหรับ MongoDB (Products)
@@ -91,117 +83,156 @@ def get_products(mongo_db = Depends(get_mongo_db)):
         prod["_id"] = str(prod["_id"]) # แปลง ObjectId ให้เป็น String
     return products
 
+#from polly's branch
+@app.post("/api/v1/reviews", status_code=201)
+def create_review(review: schemas.Review, mongo_db = Depends(get_mongo_db)):
+    # เพิ่ม Endpoint ให้รองรับ Review ของคนที่ 2
+    review_dict = review.model_dump() if hasattr(review, "model_dump") else review.dict()
+    result = mongo_db["reviews"].insert_one(review_dict)
+    review_dict["_id"] = str(result.inserted_id)
+    return {"message": "Review created", "review": review_dict}
+
 # ==========================================
 # Endpoint แบบ Dual-DB (Orders)
 # ==========================================
 @app.post("/api/v1/orders", status_code=201)
 def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db = Depends(get_mongo_db)):
+    # 1. ตรวจสอบข้อมูล Product จาก MongoDB (ดึงราคา, สต็อก)
+    # 2. บันทึก Transaction การสั่งซื้อลง PostgreSQL (ตาราง orders, order_items)
+    # 3. อัปเดตข้อมูลหรือทำ Audit log กลับไปที่ MongoDB
+
+    #from ice's branch
+    if not hasattr(models, "Order") or not hasattr(models, "OrderItem"):
+        raise HTTPException(
+            status_code=503,
+            detail="Order and OrderItem models are not available yet",
+        )
+
+    if not order.items:
+        raise HTTPException(status_code=422, detail="Order must contain at least one item")
+
     user = db.query(models.User).filter(models.User.id == order.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if not order.items:
-        raise HTTPException(status_code=400, detail="Order must include at least one item")
-
-    total_amount = 0
-    order_items = []
+    products_to_order = []
+    requested_product_ids = set()
 
     for item in order.items:
-        product = mongo_db["products"].find_one({"_id": item.product_id})
-        if product is None:
-            product = mongo_db["products"].find_one({"product_id": item.product_id})
-        if product is None:
-            raise HTTPException(status_code=404, detail=f"Product {item.product_id} not found in MongoDB")
+        if item.quantity < 1:
+            raise HTTPException(status_code=422, detail="Quantity must be at least 1")
 
-        unit_price = int(product.get("price", item.unit_price))
-        quantity = int(item.quantity)
-        item_total = unit_price * quantity
-        total_amount += item_total
-        order_items.append({
-            "product_id": item.product_id,
-            "quantity": quantity,
-            "unit_price": unit_price,
+        if item.product_id in requested_product_ids:
+            raise HTTPException(status_code=422, detail="A product can appear only once in an order")
+        requested_product_ids.add(item.product_id)
+
+        if not ObjectId.is_valid(item.product_id):
+            raise HTTPException(status_code=422, detail=f"Invalid product id: {item.product_id}")
+
+        product_object_id = ObjectId(item.product_id)
+        product = mongo_db["products"].find_one({"_id": product_object_id})
+        if not product:
+            raise HTTPException(status_code=404, detail=f"Product not found: {item.product_id}")
+
+        if product.get("status") not in (None, "available"):
+            raise HTTPException(status_code=409, detail=f"Product is not available: {item.product_id}")
+
+        products_to_order.append({
+            "item": item,
+            "object_id": product_object_id,
+            "previous_status": product.get("status"),
+            "had_status": "status" in product,
+            "previous_order_id": product.get("order_id"),
+            "had_order_id": "order_id" in product,
         })
 
-    db_order = models.Order(user_id=order.user_id, total_amount=total_amount, status="pending")
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
+    updated_products = []
+    db_order = None
 
-    for item in order_items:
-        db_order_item = models.OrderItem(
-            order_id=db_order.id,
-            product_id=item["product_id"],
-            quantity=item["quantity"],
-            unit_price=item["unit_price"],
-        )
-        db.add(db_order_item)
+    def restore_products():
+        if not db_order:
+            return
 
-    db.commit()
+        for product_data in updated_products:
+            restore_set = {}
+            restore_unset = {}
 
-    mongo_db["orders"].insert_one({
-        "order_id": db_order.id,
-        "user_id": order.user_id,
-        "status": "pending",
-        "total_amount": total_amount,
-        "items": order_items,
-    })
+            if product_data["had_status"]:
+                restore_set["status"] = product_data["previous_status"]
+            else:
+                restore_unset["status"] = ""
+
+            if product_data["had_order_id"]:
+                restore_set["order_id"] = product_data["previous_order_id"]
+            else:
+                restore_unset["order_id"] = ""
+
+            restore_update = {}
+            if restore_set:
+                restore_update["$set"] = restore_set
+            if restore_unset:
+                restore_update["$unset"] = restore_unset
+
+            mongo_db["products"].update_one(
+                {"_id": product_data["object_id"], "order_id": db_order.id},
+                restore_update,
+            )
+
+    try:
+        db_order = models.Order(user_id=order.user_id)
+        db.add(db_order)
+        db.flush()
+
+        for product_data in products_to_order:
+            item = product_data["item"]
+            if item.quantity != 1 and not hasattr(models.OrderItem, "quantity"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="OrderItem model does not support quantities greater than 1",
+                )
+            order_item_data = {
+                "order_id": db_order.id,
+                "product_id": item.product_id,
+            }
+            if hasattr(models.OrderItem, "quantity"):
+                order_item_data["quantity"] = item.quantity
+            db.add(models.OrderItem(**order_item_data))
+
+        for product_data in products_to_order:
+            product_filter = {"_id": product_data["object_id"]}
+            previous_status = product_data["previous_status"]
+            if product_data["had_status"]:
+                product_filter["status"] = previous_status
+            else:
+                product_filter["status"] = {"$exists": False}
+
+            result = mongo_db["products"].update_one(
+                product_filter,
+                {"$set": {"status": "sold", "order_id": db_order.id}},
+            )
+            if result.modified_count != 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Product is no longer available: {product_data['item'].product_id}",
+                )
+            updated_products.append(product_data)
+
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        restore_products()
+        raise
+    except Exception:
+        db.rollback()
+        restore_products()
+        raise HTTPException(status_code=500, detail="Could not create order")
 
     return {
         "message": "Order created successfully",
-        "order": {
-            "id": db_order.id,
-            "user_id": db_order.user_id,
-            "total_amount": db_order.total_amount,
-            "status": db_order.status,
-            "items": order_items,
-        },
-    }
-
-
-@app.get("/api/v1/orders")
-def get_orders(db: Session = Depends(get_pg_db)):
-    orders = db.query(models.Order).all()
-    result = []
-    for order in orders:
-        result.append({
-            "id": order.id,
-            "user_id": order.user_id,
-            "total_amount": order.total_amount,
-            "status": order.status,
-            "items": [
-                {
-                    "id": item.id,
-                    "order_id": item.order_id,
-                    "product_id": item.product_id,
-                    "quantity": item.quantity,
-                    "unit_price": item.unit_price,
-                }
-                for item in order.items
-            ],
-        })
-    return result
-
-
-@app.get("/api/v1/orders/{order_id}")
-def get_order(order_id: int, db: Session = Depends(get_pg_db)):
-    order = db.query(models.Order).filter(models.Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    return {
-        "id": order.id,
+        "order_id": db_order.id,
         "user_id": order.user_id,
-        "total_amount": order.total_amount,
-        "status": order.status,
         "items": [
-            {
-                "id": item.id,
-                "order_id": item.order_id,
-                "product_id": item.product_id,
-                "quantity": item.quantity,
-                "unit_price": item.unit_price,
-            }
+            item.model_dump() if hasattr(item, "model_dump") else item.dict()
             for item in order.items
         ],
     }
