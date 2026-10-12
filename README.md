@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛍️ 2Handy — Secondhand Marketplace API
+# 2Handy — Secondhand Marketplace API
 
 **A dual-database backend (PostgreSQL + MongoDB) with a zero-downtime schema migration**
 
@@ -16,22 +16,22 @@ Course project for **269340: Data Centric Application Development**
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [Overview](#-overview)
-- [Team Roster](#-team-roster-the-smachik-gang)
-- [System Architecture](#-system-architecture)
-- [Tech Stack](#-tech-stack)
-- [Project Structure](#-project-structure)
-- [Getting Started](#-getting-started)
-- [API Reference](#-api-reference)
-- [Data Model](#-data-model)
-- [Checkpoint 2: Zero-Downtime Schema Migration](#-checkpoint-2-zero-downtime-schema-migration-expand--contract)
-- [Troubleshooting](#-troubleshooting)
+- [Overview](#overview)
+- [Team Roster](#team-roster-the-smachik-gang)
+- [System Architecture](#system-architecture)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Data Model](#data-model)
+- [Checkpoint 2: Zero-Downtime Schema Migration](#checkpoint-2-zero-downtime-schema-migration-expand--contract)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
-## 📖 Overview
+## Overview
 
 **2Handy** is the backend API of a secondhand marketplace platform. It is built around two ideas:
 
@@ -42,7 +42,7 @@ Course project for **269340: Data Centric Application Development**
 
 ---
 
-## 👥 Team Roster (the smachik gang)
+## Team Roster (the smachik gang)
 
 | # | Student ID | Name | Responsibility |
 | :-: | :--- | :--- | :--- |
@@ -53,7 +53,7 @@ Course project for **269340: Data Centric Application Development**
 
 ---
 
-## 🏗 System Architecture
+## System Architecture
 
 <div align="center">
 
@@ -68,7 +68,7 @@ Course project for **269340: Data Centric Application Development**
 | **PostgreSQL** | Transactional data: `users`, `orders`, `order_items`. |
 | **MongoDB** | Flexible document data: `products`, `reviews`. |
 
-> **Note:** `docker-compose.yml` starts the two databases. The FastAPI server itself is run on the host with `uvicorn` (see [Getting Started](#-getting-started)).
+> **Note:** `docker-compose.yml` starts the two databases. The FastAPI server itself is run on the host with `uvicorn` (see [Getting Started](#getting-started)).
 
 ### How an order touches both databases
 
@@ -96,7 +96,7 @@ sequenceDiagram
 
 ---
 
-## 🧰 Tech Stack
+## Tech Stack
 
 | Layer | Technology |
 | :--- | :--- |
@@ -111,7 +111,7 @@ sequenceDiagram
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
 2Handy/
@@ -138,7 +138,7 @@ sequenceDiagram
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -211,7 +211,7 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 
 ---
 
-## 📡 API Reference
+## API Reference
 
 Base URL: `http://127.0.0.1:8000`
 
@@ -301,7 +301,7 @@ If any step fails, the PostgreSQL transaction is rolled back and the MongoDB pro
 
 ---
 
-## 🗄 Data Model
+## Data Model
 
 ### PostgreSQL (transactional)
 
@@ -363,7 +363,7 @@ When a product is ordered, `status` becomes `"sold"` and an `order_id` pointing 
 
 ---
 
-## 🔄 Checkpoint 2: Zero-Downtime Schema Migration (Expand & Contract)
+## Checkpoint 2: Zero-Downtime Schema Migration (Expand & Contract)
 
 ### Migration Scenario
 
@@ -495,21 +495,13 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/verify_user_name_post_cont
 
 ---
 
-## 🛠 Troubleshooting
+## Troubleshooting
 
 | Problem | Fix |
 | :--- | :--- |
 | `connection refused` on port `5432` or `27017` | Check the containers are up with `docker compose ps`, then `docker compose up -d`. |
 | Port `5432` / `27017` already in use | Stop the local PostgreSQL / MongoDB service, or change the port mapping in `docker-compose.yml`. |
-| `ModuleNotFoundError` | Activate the virtual environment and re-run the `pip install` command from [Getting Started](#-getting-started). |
+| `ModuleNotFoundError` | Activate the virtual environment and re-run the `pip install` command from [Getting Started](#getting-started). |
 | Want to rerun the migration demo from the start | Run `python seed.py` — it resets the tables, the phase (back to 1), and the backfill checkpoint. |
 | Want a completely clean database | `docker compose down -v` removes the volumes, then start again from step 2. |
 | Check which phase the API is in | `python switch_phase.py` (no argument) or `GET /api/v1/migration/phase`. |
-
----
-
-<div align="center">
-
-Made with ❤️ by **the smachik gang** · 269340 Data Centric Application Development
-
-</div>
