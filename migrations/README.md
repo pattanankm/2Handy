@@ -55,3 +55,17 @@ psql "$env:DATABASE_URL" -v ON_ERROR_STOP=1 -v confirm_contract=true -f migratio
 The script refuses to run without the explicit flag, re-checks every legacy name can be rebuilt from the new fields, and uses a short DDL lock timeout. If the validation or lock acquisition fails, PostgreSQL rolls back the transaction and retains `users.name`.
 
 After it succeeds, run `verify_user_name_post_contract.sql`. It verifies that the old field was removed and the target fields remain populated; keep the pre-contract verification output as the exact legacy-to-new data-loss proof.
+
+## Checkpoint 3 — MongoDB product versions
+
+The MongoDB migration is separate from the PostgreSQL name migration. Run it
+against the configured MongoDB database to backfill legacy product documents and
+create the indexes used by the CP3 query layer:
+
+```powershell
+python migrations/006_mongo_add_version.py
+```
+
+Documents without a `version` receive version `0`; newly created products start
+at version `1`. The product update and sale queries match the expected version
+and increment it atomically.

@@ -3,6 +3,7 @@ from faker import Faker
 import random
 from database import SessionLocal, engine, get_mongo_db
 import models
+import mongo_queries
 
 # ลบตารางเก่า (ถ้ามี) เพื่อเริ่มต้นใหม่
 models.Base.metadata.drop_all(bind=engine)
@@ -89,6 +90,7 @@ def seed_mongo(num_products=1000):
                 "name": fake.catch_phrase(),
                 "category": category,
                 "status": "available", 
+                "version": 1,
                 "attributes": {
                     "condition": random.choice(conditions),
                     "price": round(random.uniform(50.0, 10000.0), 2),
@@ -101,6 +103,7 @@ def seed_mongo(num_products=1000):
             products.append(product)
             
         mongo_db["products"].insert_many(products)
+        mongo_queries.ensure_indexes(mongo_db)
         print("✅ Create data to MongoDB completed!")
         
     except Exception as e:

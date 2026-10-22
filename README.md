@@ -20,6 +20,30 @@ The system is designed with separated responsibilities within a Docker Compose e
 * **PostgreSQL (Transactional Data):** A relational database managing core transactional domain data (`Users`, `Orders`, and `Order Items`).
 * **MongoDB (Flexible Data):** A document store managing flexible, semi-structured data (`Products` and `Reviews`).
 
+## Checkpoint 3: MongoDB Concurrency and Query Performance
+
+The MongoDB layer uses optimistic concurrency control for products. Each product has
+a `version` token, and updates match both the product ID and the version read by the
+caller. A successful update increments the token atomically; stale writers are
+rejected and the API returns `409 Conflict`.
+
+MongoDB reads use projections for product, product-state, and review endpoints.
+Product summaries use one aggregation with `$lookup` instead of one review query
+per product. Run the migration once for products created before Checkpoint 3:
+
+```powershell
+python migrations/006_mongo_add_version.py
+```
+
+The focused verification uses a throwaway database and 20 concurrent writers:
+
+```powershell
+python test_mongo_concurrency.py
+```
+
+It verifies one successful writer, 19 rejected stale writers, legacy-version
+compatibility, projection output, and one aggregation query for summaries.
+
 ---
 
 ## ⚙️ Prerequisites

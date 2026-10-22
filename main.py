@@ -1,12 +1,14 @@
 # main.py
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Tuple
 from bson import ObjectId
+import datetime
 
 import models
+import mongo_queries
 import schemas #from polly's branch
 from database import engine, get_pg_db, get_mongo_db
 
@@ -88,6 +90,13 @@ class ProductCreate(BaseModel):
     name: str
     category: str
     attributes: Dict[str, Any] # รับค่า Dynamic attributes แบบยืดหยุ่นสำหรับ MongoDB
+
+
+class ProductUpdate(BaseModel):
+    version: int  # version ที่ client อ่านมา (OCC)
+    name: Optional[str] = None
+    category: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
 
 
 class OrderItemCreate(BaseModel):
@@ -219,25 +228,85 @@ def update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get
 def create_product(product: ProductCreate, mongo_db = Depends(get_mongo_db)):
     # บันทึกข้อมูลลง Collection "products" ใน MongoDB
     product_dict = product.dict()
+    product_dict["status"] = "available"
+    product_dict["version"] = 1  # OCC version token
     result = mongo_db["products"].insert_one(product_dict)
-    
+
     # ดึง ID ที่ MongoDB สร้างให้แปลงเป็น String
     product_dict["_id"] = str(result.inserted_id)
     return {"message": "Product created", "product": product_dict}
 
 @app.get("/api/v1/products")
-def get_products(mongo_db = Depends(get_mongo_db)):
-    # ดึงข้อมูลทั้งหมดจาก MongoDB (ในงานจริงควรทำ Pagination)
-    products = list(mongo_db["products"].find())
-    for prod in products:
-        prod["_id"] = str(prod["_id"]) # แปลง ObjectId ให้เป็น String
-    return products
+def get_products(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db = Depends(get_mongo_db),
+):
+    # Projection + Pagination: ส่งเฉพาะฟิลด์ที่หน้า list ใช้
+    return mongo_queries.list_products(mongo_db, category, status, skip, limit)
+
+@app.get("/api/v1/products/summary")
+def get_product_summaries(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db = Depends(get_mongo_db),
+):
+    # Products + review_count/avg_rating in a single aggregation (no N+1)
+    return mongo_queries.list_product_summaries(mongo_db, category, status, skip, limit)
+
+@app.get("/api/v1/products/{product_id}")
+def get_product(product_id: str, mongo_db = Depends(get_mongo_db)):
+    try:
+        product = mongo_queries.get_product(mongo_db, product_id)
+    except mongo_queries.InvalidProductIdError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
+
+@app.patch("/api/v1/products/{product_id}")
+def update_product(product_id: str, product_update: ProductUpdate, mongo_db = Depends(get_mongo_db)):
+    changes = (
+        product_update.model_dump(exclude_unset=True, exclude={"version"})
+        if hasattr(product_update, "model_dump")
+        else product_update.dict(exclude_unset=True, exclude={"version"})
+    )
+    try:
+        return mongo_queries.update_product(mongo_db, product_id, product_update.version, changes)
+    except mongo_queries.InvalidProductIdError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except mongo_queries.ProductNotFoundError:
+        raise HTTPException(status_code=404, detail="Product not found")
+    except mongo_queries.VersionConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Product was modified by another request; reload and retry",
+                "expected_version": e.expected_version,
+                "current_version": e.current_version,
+            },
+        )
+
+@app.get("/api/v1/products/{product_id}/reviews")
+def get_product_reviews(
+    product_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db = Depends(get_mongo_db),
+):
+    return mongo_queries.list_reviews(mongo_db, product_id, skip, limit)
 
 #from polly's branch
 @app.post("/api/v1/reviews", status_code=201)
 def create_review(review: schemas.Review, mongo_db = Depends(get_mongo_db)):
     # เพิ่ม Endpoint ให้รองรับ Review ของคนที่ 2
     review_dict = review.model_dump() if hasattr(review, "model_dump") else review.dict()
+    if review_dict.get("created_at") is None:
+        review_dict["created_at"] = datetime.datetime.utcnow()
     result = mongo_db["reviews"].insert_one(review_dict)
     review_dict["_id"] = str(result.inserted_id)
     return {"message": "Review created", "review": review_dict}
@@ -279,7 +348,8 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
             raise HTTPException(status_code=422, detail=f"Invalid product id: {item.product_id}")
 
         product_object_id = ObjectId(item.product_id)
-        product = mongo_db["products"].find_one({"_id": product_object_id})
+        # Projection: only the state needed to sell the product (status/order_id/version)
+        product = mongo_queries.get_product_state(mongo_db, item.product_id)
         if not product:
             raise HTTPException(status_code=404, detail=f"Product not found: {item.product_id}")
 
@@ -293,6 +363,7 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
             "had_status": "status" in product,
             "previous_order_id": product.get("order_id"),
             "had_order_id": "order_id" in product,
+            "version": product["version"],
         })
 
     updated_products = []
@@ -316,7 +387,8 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
             else:
                 restore_unset["order_id"] = ""
 
-            restore_update = {}
+            # Restoring is also a write, so bump the version for anyone holding the "sold" one
+            restore_update = {"$inc": {"version": 1}}
             if restore_set:
                 restore_update["$set"] = restore_set
             if restore_unset:
@@ -348,21 +420,20 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db 
             db.add(models.OrderItem(**order_item_data))
 
         for product_data in products_to_order:
-            product_filter = {"_id": product_data["object_id"]}
-            previous_status = product_data["previous_status"]
-            if product_data["had_status"]:
-                product_filter["status"] = previous_status
-            else:
-                product_filter["status"] = {"$exists": False}
-
-            result = mongo_db["products"].update_one(
-                product_filter,
-                {"$set": {"status": "sold", "order_id": db_order.id}},
-            )
-            if result.modified_count != 1:
+            # OCC: only succeeds if nobody changed the product since we read its version
+            try:
+                mongo_queries.mark_product_sold(
+                    mongo_db, product_data["item"].product_id, product_data["version"], db_order.id
+                )
+            except (mongo_queries.VersionConflictError, mongo_queries.ProductUnavailableError):
                 raise HTTPException(
                     status_code=409,
                     detail=f"Product is no longer available: {product_data['item'].product_id}",
+                )
+            except mongo_queries.ProductNotFoundError:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Product not found: {product_data['item'].product_id}",
                 )
             updated_products.append(product_data)
 
