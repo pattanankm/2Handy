@@ -76,6 +76,8 @@ def run_backfill(batch_size: int = 100, reset_checkpoint: bool = False) -> None:
         while True:
             # Cursor pagination using primary key index (id > :last_id)
             # Avoids full-table locks and OFFSET scan overhead on large tables
+            # Hold row locks until the batch commits so a concurrent user edit
+            # cannot be overwritten with name parts from a stale snapshot.
             rows = db.execute(
                 text(
                     "SELECT id, name "
@@ -83,7 +85,7 @@ def run_backfill(batch_size: int = 100, reset_checkpoint: bool = False) -> None:
                     "WHERE id > :last_id "
                     "  AND NULLIF(btrim(first_name), '') IS NULL "
                     "ORDER BY id ASC "
-                    "LIMIT :batch_size"
+                    "LIMIT :batch_size FOR UPDATE"
                 ),
                 {"last_id": last_id, "batch_size": batch_size},
             ).mappings().all()

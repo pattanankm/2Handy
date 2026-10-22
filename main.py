@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 import models
 import schemas  # from polly's branch
+from pg_queries import lock_user, RecordNotFound
 from database import engine, get_pg_db, get_mongo_db
 
 # สั่งให้สร้างตารางใน PostgreSQL (ถ้ายังไม่มี)
@@ -415,6 +416,20 @@ def get_users(db: Session = Depends(get_pg_db)):
 @app.put("/api/v1/users/{user_id}")
 @app.put("/users/{user_id}", include_in_schema=False)
 def update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get_pg_db)):
+    # Keep the row lock through the read/modify/write transaction, including
+    # validation. The wrapper releases it on HTTP errors as well as DB errors.
+    try:
+        lock_user(db, user_id)
+        return _update_locked_user(user_id, user_update, db)
+    except RecordNotFound as exc:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+
+
+def _update_locked_user(user_id: int, user_update: UserUpdate, db: Session):
     phase = get_current_phase()
     existing = get_user(user_id, db)
 
@@ -493,6 +508,9 @@ def update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get
                     "id": user_id,
                 },
             )
+        # Read our own result while still holding the lock, before another
+        # writer can change it. Return a plain payload, not an expired ORM row.
+        result = get_user(user_id, db)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -501,7 +519,7 @@ def update_user(user_id: int, user_update: UserUpdate, db: Session = Depends(get
         db.rollback()
         raise HTTPException(status_code=500, detail="Could not update user")
 
-    return get_user(user_id, db)
+    return result
 
 
 # ==========================================

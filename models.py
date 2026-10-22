@@ -1,5 +1,5 @@
 # models.py
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Index
 from sqlalchemy.orm import relationship
 from database import Base
 import datetime
@@ -22,6 +22,7 @@ class User(Base):
 
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (Index("ix_orders_user_id_id", "user_id", "id"),)
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)

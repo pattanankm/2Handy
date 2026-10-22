@@ -53,6 +53,11 @@ Course project for **269340: Data Centric Application Development**
 
 ---
 
+## Checkpoint 3: PostgreSQL Concurrency & Query Audit (Member 1)
+
+See [PostgreSQL implementation, tests, and API handoff](docs/checkpoint3-postgresql.md)
+for row locking, single-query order reads, projections, index migration, and isolated PostgreSQL tests.
+
 ## System Architecture
 
 <div align="center">
