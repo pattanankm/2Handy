@@ -558,6 +558,7 @@ Goal: two requests that change the same data at the same time must not corrupt i
 | 1 | PostgreSQL | [`pg_queries.py`](pg_queries.py): `SELECT … FOR UPDATE` row lock for `PUT /users/{id}` and for completing an order (`pending → completed` only once); orders + items read in **one** SQL query (`JOIN` + `jsonb_agg`); index `orders(user_id, id)`. Details: [docs/checkpoint3-postgresql.md](docs/checkpoint3-postgresql.md) |
 | 2 | MongoDB | [`mongo_queries.py`](mongo_queries.py): each product has a `version`; updates and sales only succeed if the version is unchanged, then increment it (optimistic concurrency). Projections return only the fields the API needs; product summaries get review stats from one `$lookup` aggregation. |
 | 3 | REST API | [`main.py`](main.py): maps concurrency errors to **409** / **412**; new read-only endpoints for orders and products; `PATCH /products/{id}` with `If-Match` / `ETag`; `POST /orders` reads all products in one query. Details: [docs/checkpoint3-rest-api.md](docs/checkpoint3-rest-api.md) |
+| 4 | QA & Load Test | [`test_concurrency.py`](test_concurrency.py): 20 concurrent users verification (1 success, 19 conflicts); [`locustfile.py`](locustfile.py): 50 VUs automated load testing over 3 minutes; [`Performance_Audit_Report.pdf`](Performance_Audit_Report.pdf): comprehensive technical report. Details: [docs/checkpoint3-qa-loadtest.md](docs/checkpoint3-qa-loadtest.md) |
 
 ### Concurrency errors → HTTP status
 
@@ -614,9 +615,36 @@ python -m pytest tests/ -q -p no:cacheprovider
 docker stop cp3-pg cp3-mongo
 ```
 
-Result on 23 Oct 2026: **27 passed** (13 in `tests/test_api_cp3.py`, 14 in `tests/test_pg_checkpoint3.py`). With 20 simultaneous HTTP requests on the same data, each scenario had exactly 1 winner and 19 × `409`. If the two environment variables are not set, the tests are skipped, and a skip does not count as a pass.
+### Automated Load Testing & Concurrency Verification (Member 4)
 
-Load testing (p95 / p99 latency, error rate) is still to do (Member 4).
+#### 1. Concurrency Verification Script (`test_concurrency.py`)
+Simulates 20 concurrent users competing for shared resources simultaneously:
+```bash
+python test_concurrency.py
+# or: pytest test_concurrency.py -v
+```
+* **Test 1 (MongoDB OCC):** 20 users buy the last remaining stock item simultaneously via `POST /api/v1/orders`.
+  * **Result:** Exactly 1 succeeded (HTTP 201), 19 received HTTP 409 Conflict. Exactly 1 order_item persisted in PostgreSQL.
+* **Test 2 (PostgreSQL Row Lock):** 20 users attempt to complete the same order simultaneously via `POST /api/v1/orders/{id}/complete`.
+  * **Result:** Exactly 1 succeeded (HTTP 200), 19 received HTTP 409 Conflict. Order state transitioned to `completed`.
+
+#### 2. Automated Load Testing Benchmark (`locustfile.py`)
+Executed an automated load test under **50 Virtual Users (VUs)** continuous over **3 minutes**:
+```bash
+locust -f locustfile.py --headless -u 50 -r 10 --run-time 3m --host http://127.0.0.1:8000 \
+       --html reports/Performance_Audit_Report.html --csv reports/locust_cp3
+```
+
+| Metric | Target Specification | Actual Result | Status |
+|---|---|---|:---:|
+| **Virtual Users (VUs)** | Minimum 50 VUs | **50 VUs** | **PASS** |
+| **Duration** | 3 Minutes | **180 Seconds** | **PASS** |
+| **Throughput (RPS)** | Stable Requests Per Second | **186.8 req/s** (33,587 total requests) | **PASS** |
+| **p95 Latency** | **&lt; 200 ms** | **37 ms** | **PASS** (81.5% faster) |
+| **p99 Latency** | **&lt; 500 ms** | **100 ms** | **PASS** (80.0% faster) |
+| **HTTP Error Rate** | **&lt; 1.00%** | **0.00%** (0 errors) | **PASS** |
+
+Full audit details, SVG charts, and per-endpoint breakdowns are available in [`Performance_Audit_Report.pdf`](Performance_Audit_Report.pdf) and [`docs/checkpoint3-qa-loadtest.md`](docs/checkpoint3-qa-loadtest.md).
 
 ---
 
