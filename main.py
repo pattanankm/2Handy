@@ -3,22 +3,119 @@ import os
 import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+from contextlib import asynccontextmanager
+
 from bson import ObjectId
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from pymongo.errors import OperationFailure
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import models
+import mongo_queries  # from prem's branch
 import schemas  # from polly's branch
-from pg_queries import lock_user, RecordNotFound
+from pg_queries import (
+    ConcurrentUpdate,
+    RecordNotFound,
+    complete_order,
+    get_order,
+    list_orders,
+    lock_user,
+)
 from database import engine, get_pg_db, get_mongo_db
 
 # สั่งให้สร้างตารางใน PostgreSQL (ถ้ายังไม่มี)
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="2Handy API")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Indexes used by the CP3 MongoDB read queries (idempotent)
+    mongo_queries.ensure_indexes(get_mongo_db())
+    yield
+
+
+app = FastAPI(title="2Handy API", lifespan=lifespan)
+
+
+# ==========================================
+# CP3: Concurrency errors -> HTTP status
+# ==========================================
+# PostgreSQL SQLSTATEs that mean "another transaction got there first":
+# serialization_failure, deadlock_detected, lock_not_available.
+PG_CONCURRENCY_SQLSTATES = {"40001", "40P01", "55P03"}
+# MongoDB WriteConflict
+MONGO_WRITE_CONFLICT = 112
+
+
+def is_pg_concurrency_error(exc: BaseException) -> bool:
+    orig = getattr(exc, "orig", None)
+    return getattr(orig, "pgcode", None) in PG_CONCURRENCY_SQLSTATES
+
+
+def is_mongo_concurrency_error(exc: OperationFailure) -> bool:
+    return exc.code == MONGO_WRITE_CONFLICT or exc.has_error_label("TransientTransactionError")
+
+
+def _conflict(detail: Any) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"detail": detail})
+
+
+@app.exception_handler(ConcurrentUpdate)
+def handle_concurrent_update(_request: Request, exc: ConcurrentUpdate):
+    return _conflict(str(exc))
+
+
+@app.exception_handler(mongo_queries.VersionConflictError)
+def handle_version_conflict(_request: Request, exc: mongo_queries.VersionConflictError):
+    return _conflict({
+        "message": "Product was modified by another request; reload and retry",
+        "expected_version": exc.expected_version,
+        "current_version": exc.current_version,
+    })
+
+
+@app.exception_handler(mongo_queries.ProductUnavailableError)
+def handle_product_unavailable(_request: Request, exc: mongo_queries.ProductUnavailableError):
+    return _conflict(str(exc))
+
+
+@app.exception_handler(RecordNotFound)
+@app.exception_handler(mongo_queries.ProductNotFoundError)
+def handle_not_found(_request: Request, exc: Exception):
+    return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(mongo_queries.InvalidProductIdError)
+def handle_invalid_product_id(_request: Request, exc: mongo_queries.InvalidProductIdError):
+    return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+
+@app.exception_handler(DBAPIError)
+def handle_db_error(_request: Request, exc: DBAPIError):
+    # Only real concurrency failures are 409; broken SQL or a lost connection is still 500.
+    # The request's Session is closed (and so rolled back) by get_pg_db.
+    if is_pg_concurrency_error(exc):
+        return _conflict("Concurrent update detected; retry the request")
+    return JSONResponse(status_code=500, content={"detail": "Database error"})
+
+
+@app.exception_handler(OperationFailure)
+def handle_mongo_error(_request: Request, exc: OperationFailure):
+    if is_mongo_concurrency_error(exc):
+        return _conflict("Concurrent update detected; retry the request")
+    return JSONResponse(status_code=500, content={"detail": "Database error"})
+
+
+def raise_db_error(exc: SQLAlchemyError, detail: str) -> None:
+    """For handlers that catch SQLAlchemyError themselves: keep 409 distinct from 500."""
+    if is_pg_concurrency_error(exc):
+        raise HTTPException(status_code=409, detail="Concurrent update detected; retry the request") from exc
+    raise HTTPException(status_code=500, detail=detail) from exc
+
 
 PHASE_FILE = Path(__file__).resolve().parent / ".migration_phase"
 
@@ -161,6 +258,14 @@ class ProductCreate(BaseModel):
     attributes: Dict[str, Any]  # รับค่า Dynamic attributes แบบยืดหยุ่นสำหรับ MongoDB
 
 
+class ProductUpdate(BaseModel):
+    # version ที่ client อ่านมา (OCC) — ส่งใน body หรือส่งเป็น header If-Match ก็ได้
+    version: Optional[int] = None
+    name: Optional[str] = None
+    category: Optional[str] = None
+    attributes: Optional[Dict[str, Any]] = None
+
+
 class OrderItemCreate(BaseModel):
     product_id: str
     quantity: int = 1
@@ -290,9 +395,9 @@ def create_user(user: UserCreate, db: Session = Depends(get_pg_db)):
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Email already exists")
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Could not create user")
+        raise_db_error(exc, "Could not create user")
 
     return {"message": "User created", "user": user_payload}
 
@@ -515,9 +620,9 @@ def _update_locked_user(user_id: int, user_update: UserUpdate, db: Session):
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Email already exists")
-    except SQLAlchemyError:
+    except SQLAlchemyError as exc:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Could not update user")
+        raise_db_error(exc, "Could not update user")
 
     return result
 
@@ -530,6 +635,8 @@ def _update_locked_user(user_id: int, user_update: UserUpdate, db: Session):
 def create_product(product: ProductCreate, mongo_db=Depends(get_mongo_db)):
     # บันทึกข้อมูลลง Collection "products" ใน MongoDB
     product_dict = product.model_dump() if hasattr(product, "model_dump") else product.dict()
+    product_dict["status"] = "available"
+    product_dict["version"] = 1  # OCC version token
     result = mongo_db["products"].insert_one(product_dict)
 
     # ดึง ID ที่ MongoDB สร้างให้แปลงเป็น String
@@ -537,13 +644,109 @@ def create_product(product: ProductCreate, mongo_db=Depends(get_mongo_db)):
     return {"message": "Product created", "product": product_dict}
 
 
+def _etag(version: int) -> str:
+    return f'"{version}"'
+
+
+def _version_from_if_match(if_match: str) -> int:
+    value = if_match.strip()
+    if value.startswith("W/"):
+        value = value[2:]
+    value = value.strip('"')
+    if not value.isdigit():
+        raise HTTPException(status_code=400, detail='If-Match must be a product version ETag such as "3"')
+    return int(value)
+
+
+# --- Read-only endpoints: projection + pagination, one MongoDB query each (no N+1) ---
+
 @app.get("/api/v1/products")
-def get_products(mongo_db=Depends(get_mongo_db)):
-    # ดึงข้อมูลทั้งหมดจาก MongoDB (ในงานจริงควรทำ Pagination)
-    products = list(mongo_db["products"].find())
-    for prod in products:
-        prod["_id"] = str(prod["_id"])  # แปลง ObjectId ให้เป็น String
-    return products
+def get_products(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db=Depends(get_mongo_db),
+):
+    return mongo_queries.list_products(mongo_db, category, status, skip, limit)
+
+
+# Declared before /{product_id} so "summary" is not parsed as a product id
+@app.get("/api/v1/products/summary")
+def get_product_summaries(
+    category: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db=Depends(get_mongo_db),
+):
+    # review_count / avg_rating come from one $lookup aggregation, not a query per product
+    return mongo_queries.list_product_summaries(mongo_db, category, status, skip, limit)
+
+
+@app.get("/api/v1/products/{product_id}")
+def get_product(product_id: str, response: Response, mongo_db=Depends(get_mongo_db)):
+    product = mongo_queries.get_product(mongo_db, product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    response.headers["ETag"] = _etag(product["version"])
+    return product
+
+
+@app.get("/api/v1/products/{product_id}/reviews")
+def get_product_reviews(
+    product_id: str,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    mongo_db=Depends(get_mongo_db),
+):
+    mongo_queries.to_object_id(product_id)  # 422 for a malformed id
+    return mongo_queries.list_reviews(mongo_db, product_id, skip, limit)
+
+
+@app.patch("/api/v1/products/{product_id}")
+def update_product(
+    product_id: str,
+    product_update: ProductUpdate,
+    response: Response,
+    if_match: Optional[str] = Header(None),
+    mongo_db=Depends(get_mongo_db),
+):
+    """OCC update. A stale If-Match header -> 412; a stale body `version` -> 409."""
+    header_version = _version_from_if_match(if_match) if if_match is not None else None
+    body_version = product_update.version
+    if header_version is None and body_version is None:
+        raise HTTPException(
+            status_code=428,
+            detail="Send the product version in the If-Match header or the body",
+        )
+    if header_version is not None and body_version is not None and header_version != body_version:
+        raise HTTPException(status_code=422, detail="If-Match and body version disagree")
+    expected_version = header_version if header_version is not None else body_version
+
+    changes = (
+        product_update.model_dump(exclude_unset=True, exclude={"version"})
+        if hasattr(product_update, "model_dump")
+        else product_update.dict(exclude_unset=True, exclude={"version"})
+    )
+    try:
+        product = mongo_queries.update_product(mongo_db, product_id, expected_version, changes)
+    except mongo_queries.VersionConflictError as exc:
+        if header_version is None:
+            raise  # -> 409 Conflict via handle_version_conflict
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "message": "If-Match does not match the current product version",
+                "expected_version": exc.expected_version,
+                "current_version": exc.current_version,
+            },
+            headers={"ETag": _etag(exc.current_version)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    response.headers["ETag"] = _etag(product["version"])
+    return product
 
 
 # from polly's branch
@@ -551,6 +754,9 @@ def get_products(mongo_db=Depends(get_mongo_db)):
 def create_review(review: schemas.Review, mongo_db=Depends(get_mongo_db)):
     # เพิ่ม Endpoint ให้รองรับ Review ของคนที่ 2
     review_dict = review.model_dump() if hasattr(review, "model_dump") else review.dict()
+    if review_dict.get("created_at") is None:
+        # list_reviews sorts by created_at
+        review_dict["created_at"] = datetime.datetime.utcnow()
     result = mongo_db["reviews"].insert_one(review_dict)
     review_dict["_id"] = str(result.inserted_id)
     return {"message": "Review created", "review": review_dict}
@@ -579,7 +785,6 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
     if not user_exists:
         raise HTTPException(status_code=404, detail="User not found")
 
-    products_to_order = []
     requested_product_ids = set()
 
     for item in order.items:
@@ -593,8 +798,15 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
         if not ObjectId.is_valid(item.product_id):
             raise HTTPException(status_code=422, detail=f"Invalid product id: {item.product_id}")
 
-        product_object_id = ObjectId(item.product_id)
-        product = mongo_db["products"].find_one({"_id": product_object_id})
+    # One $in query for every item instead of one find_one per item (no N+1).
+    # Projection: only the state needed to sell the product (status/order_id/version)
+    product_states = mongo_queries.get_product_states(
+        mongo_db, [item.product_id for item in order.items]
+    )
+
+    products_to_order = []
+    for item in order.items:
+        product = product_states.get(item.product_id)
         if not product:
             raise HTTPException(status_code=404, detail=f"Product not found: {item.product_id}")
 
@@ -603,11 +815,12 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
 
         products_to_order.append({
             "item": item,
-            "object_id": product_object_id,
+            "object_id": ObjectId(item.product_id),
             "previous_status": product.get("status"),
             "had_status": "status" in product,
             "previous_order_id": product.get("order_id"),
             "had_order_id": "order_id" in product,
+            "version": product["version"],
         })
 
     updated_products = []
@@ -631,7 +844,8 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
             else:
                 restore_unset["order_id"] = ""
 
-            restore_update = {}
+            # Restoring is also a write, so bump the version for anyone holding the "sold" one
+            restore_update = {"$inc": {"version": 1}}
             if restore_set:
                 restore_update["$set"] = restore_set
             if restore_unset:
@@ -663,22 +877,21 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
             db.add(models.OrderItem(**order_item_data))
 
         for product_data in products_to_order:
-            product_filter = {"_id": product_data["object_id"]}
-            previous_status = product_data["previous_status"]
-            if product_data["had_status"]:
-                product_filter["status"] = previous_status
-            else:
-                product_filter["status"] = {"$exists": False}
-
-            result = mongo_db["products"].update_one(
-                product_filter,
-                {"$set": {"status": "sold", "order_id": db_order.id}},
-            )
-            if result.modified_count != 1:
+            # OCC: only succeeds if nobody changed the product since we read its version
+            try:
+                mongo_queries.mark_product_sold(
+                    mongo_db, product_data["item"].product_id, product_data["version"], db_order.id
+                )
+            except (mongo_queries.VersionConflictError, mongo_queries.ProductUnavailableError) as exc:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Product is no longer available: {product_data['item'].product_id}",
-                )
+                ) from exc
+            except mongo_queries.ProductNotFoundError as exc:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Product not found: {product_data['item'].product_id}",
+                ) from exc
             updated_products.append(product_data)
 
         db.commit()
@@ -686,10 +899,12 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
         db.rollback()
         restore_products()
         raise
-    except Exception:
+    except Exception as exc:
         db.rollback()
         restore_products()
-        raise HTTPException(status_code=500, detail="Could not create order")
+        if is_pg_concurrency_error(exc):
+            raise HTTPException(status_code=409, detail="Concurrent update detected; retry the request") from exc
+        raise HTTPException(status_code=500, detail="Could not create order") from exc
 
     return {
         "message": "Order created successfully",
@@ -700,3 +915,34 @@ def create_order(order: OrderCreate, db: Session = Depends(get_pg_db), mongo_db=
             for item in order.items
         ],
     }
+
+
+# --- Read-only endpoints: orders + items in ONE SQL statement (JOIN + jsonb_agg, no N+1) ---
+
+@app.get("/api/v1/orders")
+def read_orders(
+    user_id: Optional[int] = Query(None, gt=0),
+    after_id: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_pg_db),
+):
+    # Keyset pagination: pass the last returned id as after_id for the next page
+    return list_orders(db, user_id=user_id, after_id=after_id, limit=limit)
+
+
+@app.get("/api/v1/orders/{order_id}")
+def read_order(order_id: int, db: Session = Depends(get_pg_db)):
+    return get_order(db, order_id)  # RecordNotFound -> 404
+
+
+@app.post("/api/v1/orders/{order_id}/complete")
+def finish_order(order_id: int, db: Session = Depends(get_pg_db)):
+    # SELECT ... FOR UPDATE: concurrent callers wait, then see the order is no longer
+    # pending -> ConcurrentUpdate -> 409 Conflict (RecordNotFound -> 404)
+    try:
+        result = complete_order(db, order_id)
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        raise

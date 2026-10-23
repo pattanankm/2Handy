@@ -44,3 +44,17 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -v confirm_contract=true -f migrations/0
 python switch_phase.py 5
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/verify_user_name_post_contract.sql
 ```
+
+## Checkpoint 3 — MongoDB product versions
+
+The MongoDB migration is separate from the PostgreSQL name migration. Run it
+against the configured MongoDB database to backfill legacy product documents and
+create the indexes used by the CP3 query layer:
+
+```powershell
+python migrations/006_mongo_add_version.py
+```
+
+Documents without a `version` receive version `0`; newly created products start
+at version `1`. The product update and sale queries match the expected version
+and increment it atomically.

@@ -27,6 +27,7 @@ Course project for **269340: Data Centric Application Development**
 - [API Reference](#api-reference)
 - [Data Model](#data-model)
 - [Checkpoint 2: Zero-Downtime Schema Migration](#checkpoint-2-zero-downtime-schema-migration-expand--contract)
+- [Checkpoint 3: Concurrency Control & Performance Audit](#checkpoint-3-concurrency-control--performance-audit)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -39,6 +40,7 @@ Course project for **269340: Data Centric Application Development**
 | :--- | :--- |
 | **Checkpoint 1 — Dual-Database Architecture** | Transactional data (`Users`, `Orders`, `Order Items`) lives in **PostgreSQL**, while flexible, semi-structured data (`Products`, `Reviews`) lives in **MongoDB**. One endpoint (`POST /api/v1/orders`) writes to both and keeps them consistent. |
 | **Checkpoint 2 — Zero-Downtime Schema Migration** | The legacy `users.name` column is split into `first_name` + `last_name` using the **Expand and Contract (Parallel Run)** pattern, while the API keeps serving concurrent `POST` + `GET` traffic at ≥ 20 req/sec. |
+| **Checkpoint 3 — Concurrency Control & Performance Audit** | Concurrent writes can no longer overwrite each other: PostgreSQL uses row locks, MongoDB uses a `version` token (optimistic concurrency), and the API answers a lost race with **409 Conflict** / **412 Precondition Failed**. Read endpoints use projections and run a fixed number of queries per request (no N+1). |
 
 ---
 
@@ -52,11 +54,6 @@ Course project for **269340: Data Centric Application Development**
 | 4 | 670615030 | Pattanan Siriworakul | Docker, Seed Data, Backfill, Traffic Generator |
 
 ---
-
-## Checkpoint 3: PostgreSQL Concurrency & Query Audit (Member 1)
-
-See [PostgreSQL implementation, tests, and API handoff](docs/checkpoint3-postgresql.md)
-for row locking, single-query order reads, projections, index migration, and isolated PostgreSQL tests.
 
 ## System Architecture
 
@@ -86,13 +83,17 @@ sequenceDiagram
 
     C->>A: POST /api/v1/orders
     A->>P: Check user exists
-    A->>M: Check each product exists and is available
+    A->>M: Read status + version of ALL products in one $in query
     A->>P: Insert order + order_items (not committed yet)
-    A->>M: Mark products as "sold" with order_id
+    A->>M: Mark each product "sold" only if its version is unchanged (OCC)
     alt everything succeeded
         A->>P: COMMIT
         A-->>C: 201 Order created
-    else any step failed
+    else another buyer got there first
+        A->>P: ROLLBACK
+        A->>M: Restore previous product state
+        A-->>C: 409 Conflict
+    else any other step failed
         A->>P: ROLLBACK
         A->>M: Restore previous product state
         A-->>C: 4xx / 5xx error
@@ -120,25 +121,37 @@ sequenceDiagram
 
 ```text
 2Handy/
-├── main.py                 # FastAPI app: all endpoints + migration-phase logic
+├── main.py                 # FastAPI app: all endpoints, migration-phase logic, 409/412 error mapping
 ├── database.py             # PostgreSQL engine/session and MongoDB client
 ├── models.py               # SQLAlchemy models: User, Order, OrderItem
 ├── schemas.py              # Pydantic schemas: Product, Review
+├── pg_queries.py           # CP3: PostgreSQL row locks + single-query order reads
+├── mongo_queries.py        # CP3: MongoDB OCC (version), projections, $lookup summaries
+├── test_mongo_concurrency.py  # CP3: MongoDB concurrency / projection / N+1 checks
+├── requirements-test.txt   # Test dependencies (pytest, httpx, ...)
 ├── seed.py                 # Resets both DBs and seeds 1,000 users / orders / products
 ├── traffic_gen.py          # Concurrent POST + GET load generator (~30 req/sec)
 ├── switch_phase.py         # Switches the live API between migration phases 1–5
 ├── backfill.py             # Phase 3 batched backfill with checkpointing
 ├── docker-compose.yml      # PostgreSQL 15 + MongoDB 6.0
 ├── ArchitectureDiagram.jpg
-└── migrations/
-    ├── 001_expand_user_name.sql
-    ├── 002_dual_write.py
-    ├── 003_backfill.py
-    ├── 004_switch_read.py
-    ├── 005_contract_drop_legacy_user_name.sql
-    ├── verify_user_name_migration.sql
-    ├── verify_user_name_post_contract.sql
-    └── README.md           # Per-file notes for the migration scripts
+├── migrations/
+│   ├── 001_expand_user_name.sql
+│   ├── 002_dual_write.py
+│   ├── 003_backfill.py
+│   ├── 004_switch_read.py
+│   ├── 005_contract_drop_legacy_user_name.sql
+│   ├── 006_cp3_order_read_index.sql  # CP3: orders(user_id, id) index
+│   ├── 006_mongo_add_version.py      # CP3: add version=0 to old products + Mongo indexes
+│   ├── verify_user_name_migration.sql
+│   ├── verify_user_name_post_contract.sql
+│   └── README.md           # Per-file notes for the migration scripts
+├── tests/
+│   ├── test_pg_checkpoint3.py  # CP3: PostgreSQL locking + query-count tests
+│   └── test_api_cp3.py         # CP3: HTTP 409/412 under 20 concurrent requests + N+1 checks
+└── docs/
+    ├── checkpoint3-postgresql.md  # CP3 PostgreSQL notes (Member 1)
+    └── checkpoint3-rest-api.md    # CP3 REST API notes (Member 3)
 ```
 
 ---
@@ -255,9 +268,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/users \
 
 | Method | Endpoint | Description |
 | :-: | :--- | :--- |
-| `POST` | `/api/v1/products` | Create a product |
-| `GET` | `/api/v1/products` | List all products |
-| `POST` | `/api/v1/reviews` | Create a review |
+| `POST` | `/api/v1/products` | Create a product (starts with `status: "available"`, `version: 1`) |
+| `GET` | `/api/v1/products?category=&status=&skip=&limit=` | List products (projection, paginated, max 200) |
+| `GET` | `/api/v1/products/summary` | Products with `review_count` / `avg_rating` in one aggregation |
+| `GET` | `/api/v1/products/{product_id}` | Get one product; the `ETag` header holds its version |
+| `PATCH` | `/api/v1/products/{product_id}` | Update a product with optimistic concurrency (see below) |
+| `GET` | `/api/v1/products/{product_id}/reviews` | List a product's reviews (newest first, paginated) |
+| `POST` | `/api/v1/reviews` | Create a review (`created_at` is filled in if missing) |
 
 `attributes` is a free-form object, so every product category can carry its own fields:
 
@@ -273,11 +290,30 @@ curl -X POST http://127.0.0.1:8000/api/v1/reviews \
   -d '{"product_id": "<product _id>", "user_id": 1, "rating": 5, "comment": "Great condition!"}'
 ```
 
+`PATCH` needs the version the client last read. Send it in **either** place:
+
+```bash
+# 1) In the If-Match header (value from the ETag of GET /api/v1/products/{id}) -> stale = 412
+curl -X PATCH http://127.0.0.1:8000/api/v1/products/<product _id> \
+  -H 'Content-Type: application/json' -H 'If-Match: "1"' \
+  -d '{"attributes": {"price": 8500, "condition": "Like New"}}'
+
+# 2) In the body -> stale = 409
+curl -X PATCH http://127.0.0.1:8000/api/v1/products/<product _id> \
+  -H "Content-Type: application/json" \
+  -d '{"version": 1, "name": "iPhone 12 (128GB)"}'
+```
+
+On success the response has the new `version` and `ETag`. If someone else changed the product first, reload it and retry.
+
 ### Orders — PostgreSQL + MongoDB
 
 | Method | Endpoint | Description |
 | :-: | :--- | :--- |
 | `POST` | `/api/v1/orders` | Create an order and mark its products as sold |
+| `GET` | `/api/v1/orders?user_id=&after_id=&limit=` | List orders with their items in one SQL query (keyset pagination, max 100) |
+| `GET` | `/api/v1/orders/{order_id}` | Get one order with its items |
+| `POST` | `/api/v1/orders/{order_id}/complete` | Change a `pending` order to `completed` (only once) |
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/orders \
@@ -286,6 +322,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/orders \
 ```
 
 If any step fails, the PostgreSQL transaction is rolled back and the MongoDB products are restored to their previous state.
+
+To get the next page of orders, pass the last `id` you received as `after_id`:
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/orders?user_id=1&limit=50"
+curl "http://127.0.0.1:8000/api/v1/orders?user_id=1&limit=50&after_id=<last id>"
+```
 
 ### Migration Phase Control
 
@@ -298,11 +341,15 @@ If any step fails, the PostgreSQL transaction is rolled back and the MongoDB pro
 
 | Code | Meaning |
 | :-: | :--- |
+| `200` | OK |
 | `201` | Resource created |
-| `404` | User or product not found |
-| `409` | Email already exists, or product is no longer available |
-| `422` | Invalid input (empty name, conflicting name fields, bad product id, quantity < 1, duplicate product in one order) |
-| `500` | Database write failed |
+| `400` | Malformed `If-Match` header |
+| `404` | User, product or order not found |
+| `409` | Email already exists; product already sold or changed by another request; order is no longer `pending`; or a PostgreSQL deadlock / lock timeout / serialization failure or MongoDB write conflict |
+| `412` | `If-Match` version is out of date (the response `ETag` holds the current version) |
+| `422` | Invalid input (empty name, conflicting name fields, bad product id, quantity < 1, duplicate product in one order, `If-Match` and body `version` disagree) |
+| `428` | `PATCH` sent without a version (no `If-Match` and no body `version`) |
+| `500` | Other database errors (bad SQL, lost connection) — these are never reported as `409` |
 
 ---
 
@@ -497,6 +544,79 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/verify_user_name_post_cont
 ```
 
 > More detail on each migration file is in [migrations/README.md](migrations/README.md).
+
+---
+
+## Checkpoint 3: Concurrency Control & Performance Audit
+
+Goal: two requests that change the same data at the same time must not corrupt it, and read endpoints must not slow down as the data grows.
+
+### What was added
+
+| Member | Area | Added |
+| :-: | :--- | :--- |
+| 1 | PostgreSQL | [`pg_queries.py`](pg_queries.py): `SELECT … FOR UPDATE` row lock for `PUT /users/{id}` and for completing an order (`pending → completed` only once); orders + items read in **one** SQL query (`JOIN` + `jsonb_agg`); index `orders(user_id, id)`. Details: [docs/checkpoint3-postgresql.md](docs/checkpoint3-postgresql.md) |
+| 2 | MongoDB | [`mongo_queries.py`](mongo_queries.py): each product has a `version`; updates and sales only succeed if the version is unchanged, then increment it (optimistic concurrency). Projections return only the fields the API needs; product summaries get review stats from one `$lookup` aggregation. |
+| 3 | REST API | [`main.py`](main.py): maps concurrency errors to **409** / **412**; new read-only endpoints for orders and products; `PATCH /products/{id}` with `If-Match` / `ETag`; `POST /orders` reads all products in one query. Details: [docs/checkpoint3-rest-api.md](docs/checkpoint3-rest-api.md) |
+
+### Concurrency errors → HTTP status
+
+All conversions happen in one place (`@app.exception_handler` in `main.py`):
+
+| Situation | HTTP |
+| :--- | :-: |
+| `PATCH` a product with an old body `version` | `409` |
+| `PATCH` a product with an old `If-Match` header | `412` |
+| Two buyers race for the same product | winner `201`, others `409`; the losers' orders are rolled back |
+| Completing an order that is no longer `pending` | `409` |
+| PostgreSQL deadlock (`40P01`), lock timeout (`55P03`), serialization failure (`40001`) | `409` |
+| MongoDB `WriteConflict` | `409` |
+| Any other database error | `500` |
+
+`PUT /users/{id}` uses a row lock, so two edits of the same user wait in line and both succeed instead of returning `409`. It returns `409` only if waiting for the lock times out.
+
+### No N+1 queries
+
+| Endpoint | Database round trips |
+| :--- | :--- |
+| `GET /api/v1/orders` | 1 SQL query, whether the page holds 1, 10 or 50 orders |
+| `GET /api/v1/orders/{id}` | 1 SQL query |
+| `GET /api/v1/products`, `/products/{id}`, `/products/{id}/reviews` | 1 MongoDB `find` |
+| `GET /api/v1/products/summary` | 1 MongoDB `aggregate` |
+| `POST /api/v1/orders` | 1 MongoDB `find` for all products (was one `find_one` per item), then one conditional write per product |
+
+### Setup for an existing database
+
+Run once on databases created before Checkpoint 3:
+
+```powershell
+# Add version=0 to old products and create the MongoDB indexes
+python migrations/006_mongo_add_version.py
+# Add the orders(user_id, id) index (do not use --single-transaction)
+Get-Content migrations/006_cp3_order_read_index.sql | docker compose exec -T postgres_db psql -U dev_user -d main_db -v ON_ERROR_STOP=1
+```
+
+A fresh database gets both automatically: `models.py` creates the PostgreSQL index and the API creates the MongoDB indexes when it starts.
+
+### Tests
+
+The tests use throwaway containers, so they never touch `main_db`:
+
+```powershell
+pip install -r requirements-test.txt
+docker run --detach --rm --name cp3-pg --publish 127.0.0.1::5432 --env POSTGRES_USER=cp3_test --env POSTGRES_PASSWORD=cp3_test --env POSTGRES_DB=postgres postgres:15-alpine
+docker run --detach --rm --name cp3-mongo --publish 127.0.0.1::27017 mongo:6.0
+docker port cp3-pg 5432; docker port cp3-mongo 27017
+# Replace PG_PORT / MONGO_PORT with the ports printed above
+$env:PG_TEST_ADMIN_URL = 'postgresql://cp3_test:cp3_test@127.0.0.1:PG_PORT/postgres'
+$env:MONGO_TEST_URL = 'mongodb://127.0.0.1:MONGO_PORT/'
+python -m pytest tests/ -q -p no:cacheprovider
+docker stop cp3-pg cp3-mongo
+```
+
+Result on 23 Oct 2026: **27 passed** (13 in `tests/test_api_cp3.py`, 14 in `tests/test_pg_checkpoint3.py`). With 20 simultaneous HTTP requests on the same data, each scenario had exactly 1 winner and 19 × `409`. If the two environment variables are not set, the tests are skipped, and a skip does not count as a pass.
+
+Load testing (p95 / p99 latency, error rate) is still to do (Member 4).
 
 ---
 
