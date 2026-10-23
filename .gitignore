@@ -1,0 +1,13 @@
+# Python virtual environment & caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS files
+.DS_Store
+
+# Runtime migration state / checkpoints
+.migration_phase
+backfill_checkpoint.json
